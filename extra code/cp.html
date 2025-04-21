@@ -1,0 +1,970 @@
+
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Peer-to-Peer File Sharing</title>
+  <script src="https://cdn.tailwindcss.com"></script>
+</head>
+<body class="bg-gray-100 p-6">
+  <h1 class="text-2xl font-bold mb-4">Peer-to-Peer File Sharing</h1>
+  <div class="space-x-2 mb-4">
+    <button onclick="registerUser()" class="px-4 py-2 bg-blue-600 text-white rounded">Register</button>
+    <button onclick="startConnection()" class="px-4 py-2 bg-green-600 text-white rounded">Connect to Peer</button>
+    <input type="file" id="fileInput" class="border p-2" />
+    <button onclick="sendFile()" class="px-4 py-2 bg-purple-600 text-white rounded">Send File</button>
+  </div>
+  <h3 class="font-semibold">Available Peers</h3>
+  <ul id="peerList" class="mb-4 list-disc pl-6"></ul>
+  <h3 class="font-semibold">Log</h3>
+  <div id="log" class="bg-white border p-4 h-64 overflow-y-auto whitespace-pre-wrap"></div>
+
+  <script>
+    let socket;
+    let userId;
+    let peerId = null;
+    let peerConnection;
+    let dataChannel;
+    let receivedChunks = [];
+    let receivedFileName = "";
+    let expectedFileSize = 0;
+    let receivedFileSize = 0;
+    let fileReceived = false;
+
+    function logMessage(message) {
+      const log = document.getElementById("log");
+      log.textContent += `${message}\n`;
+      log.scrollTop = log.scrollHeight;
+    }
+
+    function registerUser() {
+      userId = prompt("Enter your unique ID:");
+      if (!userId) return;
+
+      socket = new WebSocket("ws://localhost:8080");
+
+      socket.onopen = () => {
+        socket.send(JSON.stringify({ type: "register", id: userId }));
+        logMessage("🔌 Connected to signaling server");
+      };
+
+      socket.onmessage = async (event) => {
+        const data = JSON.parse(event.data);
+
+        if (data.type === "peers") {
+          const list = document.getElementById("peerList");
+          list.innerHTML = "";
+          data.peers.forEach((peer) => {
+            if (peer !== userId) {
+              const li = document.createElement("li");
+              li.textContent = peer;
+              li.classList.add("text-blue-600", "cursor-pointer");
+              li.onclick = () => {
+                peerId = peer;
+                logMessage(`🎯 Selected peer: ${peerId}`);
+              };
+              list.appendChild(li);
+            }
+          });
+        } else if (data.type === "offer") {
+          peerId = data.from;
+          await createPeerConnection();
+          await peerConnection.setRemoteDescription(new RTCSessionDescription(data.offer));
+          const answer = await peerConnection.createAnswer();
+          await peerConnection.setLocalDescription(answer);
+          socket.send(JSON.stringify({ type: "answer", answer: answer, to: peerId, from: userId }));
+        } else if (data.type === "answer") {
+          await peerConnection.setRemoteDescription(new RTCSessionDescription(data.answer));
+        } else if (data.type === "candidate") {
+          if (data.candidate) {
+            await peerConnection.addIceCandidate(new RTCIceCandidate(data.candidate));
+          }
+        }
+      };
+    }
+
+    async function startConnection() {
+      if (!peerId) {
+        const manualPeerId = prompt("Enter peer ID manually:");
+        if (!manualPeerId) {
+          logMessage("❌ No peer selected or entered.");
+          return;
+        }
+        peerId = manualPeerId;
+      }
+
+      await createPeerConnection();
+      dataChannel = peerConnection.createDataChannel("fileTransfer");
+      setupDataChannel();
+
+      const offer = await peerConnection.createOffer();
+      await peerConnection.setLocalDescription(offer);
+      socket.send(JSON.stringify({ type: "offer", offer: offer, to: peerId, from: userId }));
+      logMessage(`📤 Sending offer to: ${peerId}`);
+    }
+
+    async function createPeerConnection() {
+      peerConnection = new RTCPeerConnection();
+
+      peerConnection.onicecandidate = (event) => {
+        if (event.candidate) {
+          socket.send(JSON.stringify({ type: "candidate", candidate: event.candidate, to: peerId, from: userId }));
+        }
+      };
+
+      peerConnection.ondatachannel = (event) => {
+        dataChannel = event.channel;
+        setupDataChannel();
+      };
+    }
+
+    function setupDataChannel() {
+      fileReceived = false;
+      receivedChunks = [];
+      expectedFileSize = 0;
+      receivedFileSize = 0;
+
+      dataChannel.onopen = () => logMessage("📡 Data channel open");
+
+      dataChannel.onmessage = (event) => {
+        if (typeof event.data === "string") {
+          if (event.data === "EOF" && !fileReceived) {
+            fileReceived = true;
+            logMessage("✅ File transfer complete!");
+            downloadFile();
+          } else if (event.data.startsWith("FILE_META")) {
+            const parts = event.data.split("|");
+            receivedFileName = parts[1];
+            expectedFileSize = parseInt(parts[2]);
+            receivedChunks = [];
+            receivedFileSize = 0;
+            fileReceived = false;
+            logMessage(`📄 Incoming file: ${receivedFileName} (${(expectedFileSize / 1024 / 1024).toFixed(2)} MB)`);
+          }
+        } else {
+          receivedChunks.push(event.data);
+          receivedFileSize += event.data.byteLength;
+          logMessage(`⬇️ Received: ${(receivedFileSize / 1024 / 1024).toFixed(2)} MB`);
+
+          if (receivedFileSize >= expectedFileSize && !fileReceived) {
+            fileReceived = true;
+            logMessage("✅ File transfer complete!");
+            downloadFile();
+          }
+        }
+      };
+    }
+
+    function sendFile() {
+      const fileInput = document.getElementById("fileInput");
+      const file = fileInput.files[0];
+      if (!file || !dataChannel || dataChannel.readyState !== "open") {
+        logMessage("❌ Cannot send file");
+        return;
+      }
+
+      logMessage(`📤 Sending file: ${file.name} (${(file.size / 1024 / 1024).toFixed(2)} MB)`);
+      dataChannel.send(`FILE_META|${file.name}|${file.size}`);
+
+      const chunkSize = 64 * 1024;
+      const stream = file.stream();
+      const reader = stream.getReader();
+      let sentSize = 0;
+
+      const readChunk = async () => {
+        let done = false;
+        while (!done) {
+          const result = await reader.read();
+          done = result.done;
+          if (done) break;
+
+          const value = result.value;
+
+          while (dataChannel.bufferedAmount > 1 * 1024 * 1024) {
+            await new Promise(resolve => setTimeout(resolve, 50));
+          }
+
+          dataChannel.send(value.buffer);
+          sentSize += value.byteLength;
+          logMessage(`📤 Sent: ${(sentSize / 1024 / 1024).toFixed(2)} MB / ${(file.size / 1024 / 1024).toFixed(2)} MB`);
+        }
+
+        dataChannel.send("EOF");
+        logMessage("📤 File sent successfully");
+      };
+
+      readChunk();
+    }
+
+    function downloadFile() {
+      const blob = new Blob(receivedChunks, { type: "application/octet-stream" });
+      const a = document.createElement("a");
+      a.href = URL.createObjectURL(blob);
+      a.download = receivedFileName || "downloaded_file";
+      document.body.appendChild(a);
+      a.click();
+      a.remove();
+    }
+  </script>
+</body>
+</html>
+
+<!--previous codes-->
+
+<!-- <!DOCTYPE html>
+<html lang="en">
+    <head>
+        <meta charset="UTF-8">
+        <meta name="viewport" content="width=device-width, initial-scale=1.0">
+        <title>P2P File Transfer</title>
+        <style>
+            body {
+                font-family: Arial, sans-serif;
+                background-color: #f9f9f9;
+                color: #333;
+                text-align: center;
+                margin: 0;
+                padding: 20px;
+            }
+    
+            .container {
+                max-width: 600px;
+                margin: auto;
+                background: #ffffff;
+                padding: 20px;
+                border-radius: 10px;
+                box-shadow: 0 0 10px rgba(0, 0, 0, 0.1);
+            }
+    
+            h2 {
+                margin-bottom: 10px;
+                font-size: 24px;
+            }
+    
+            .card {
+                background: #f1f1f1;
+                padding: 15px;
+                margin: 10px 0;
+                border-radius: 8px;
+                text-align: left;
+            }
+    
+            input, button {
+                width: 100%;
+                padding: 10px;
+                margin-top: 10px;
+                border-radius: 5px;
+                border: 1px solid #ccc;
+                font-size: 16px;
+            }
+    
+            input {
+                background: #fff;
+                color: #333;
+            }
+    
+            button {
+                background: #007bff;
+                color: white;
+                font-weight: bold;
+                cursor: pointer;
+                transition: 0.3s;
+            }
+    
+            button:hover {
+                background: #0056b3;
+            }
+    
+            #peerList {
+                list-style: none;
+                padding: 0;
+            }
+    
+            #peerList li {
+                background: #ddd;
+                padding: 8px;
+                margin: 5px 0;
+                border-radius: 5px;
+                cursor: pointer;
+                transition: 0.3s;
+            }
+    
+            #peerList li:hover {
+                background: #bbb;
+            }
+    
+            progress {
+                width: 100%;
+                height: 20px;
+                border-radius: 5px;
+                overflow: hidden;
+            }
+    
+            progress::-webkit-progress-bar {
+                background-color: #eee;
+            }
+    
+            progress::-webkit-progress-value {
+                background-color: #007bff;
+            }
+    
+            #downloadLink {
+                display: block;
+                background: #28a745;
+                padding: 10px;
+                color: white;
+                text-decoration: none;
+                font-weight: bold;
+                margin-top: 10px;
+                border-radius: 5px;
+            }
+    
+            #downloadLink:hover {
+                background: #1e7e34;
+            }
+    
+            #log {
+                background: #f1f1f1;
+                padding: 10px;
+                height: 150px;
+                overflow-y: auto;
+                border-radius: 5px;
+                text-align: left;
+                font-size: 14px;
+            }
+        </style>
+    </head>
+    <body>
+        <div class="container">
+            <h2>P2P File Transfer</h2>
+    
+            <div class="card">
+                <p><strong>Your Peer ID:</strong> <span id="myPeerId"></span></p>
+            </div>
+    
+            <div class="card">
+                <p><strong>Available Peers:</strong></p>
+                <ul id="peerList"></ul>
+            </div>
+    
+            <input type="file" id="fileInput">
+            <button onclick="startConnection()">Connect to Peer</button>
+            <button onclick="sendFile()">Send File</button>
+    
+            <progress id="progress" value="0" max="100"></progress>
+            <a id="downloadLink" style="display: none;">Download Received File</a>
+    
+            <div class="card">
+                <p><strong>Logs:</strong></p>
+                <pre id="log"></pre>
+            </div>
+        </div>
+
+    <script>
+        const socket = new WebSocket('ws://localhost:8080');
+        let peerConnection;
+        let dataChannel;
+        let userId = Math.random().toString(36).substring(7);
+        let peerId = null;
+        let receivedChunks = [];
+        let receivedFileName = "";
+        let expectedFileSize = 0;
+        let receivedFileSize = 0;
+
+        function logMessage(msg) {
+            document.getElementById("log").innerText += msg + "\n";
+        }
+
+        socket.onopen = () => {
+            logMessage("✅ WebSocket connected.");
+            document.getElementById("myPeerId").innerText = userId; 
+            socket.send(JSON.stringify({ type: 'register', id: userId }));
+        };
+
+        socket.onmessage = async (event) => {
+            const data = JSON.parse(event.data);
+
+            if (data.type === 'peerList') {
+                const peerList = document.getElementById("peerList");
+                peerList.innerHTML = "";
+                data.peers.forEach(peer => {
+                    if (peer !== userId) {  
+                        const li = document.createElement("li");
+                        li.innerText = peer;
+                        li.onclick = () => { peerId = peer; logMessage(`🔗 Selected Peer: ${peerId}`); };
+                        peerList.appendChild(li);
+                    }
+                });
+            }
+
+            if (data.type === 'offer') {
+                logMessage("📨 Received connection offer.");
+                peerConnection = createPeerConnection();
+                await peerConnection.setRemoteDescription(new RTCSessionDescription(data.offer));
+                const answer = await peerConnection.createAnswer();
+                await peerConnection.setLocalDescription(answer);
+                socket.send(JSON.stringify({ type: 'answer', answer, to: data.from }));
+            } 
+            else if (data.type === 'answer') {
+                logMessage("📨 Received connection answer.");
+                await peerConnection.setRemoteDescription(new RTCSessionDescription(data.answer));
+            } 
+            else if (data.type === 'candidate') {
+                peerConnection.addIceCandidate(new RTCIceCandidate(data.candidate));
+            }
+        };
+
+        function createPeerConnection() {
+            const pc = new RTCPeerConnection();
+            pc.onicecandidate = (event) => {
+                if (event.candidate) {
+                    socket.send(JSON.stringify({ type: 'candidate', candidate: event.candidate, to: peerId }));
+                }
+            };
+            
+            pc.ondatachannel = (event) => {
+                dataChannel = event.channel;
+                setupDataChannel();
+            };
+
+            return pc;
+        }
+
+        async function startConnection() {
+            //peerId = prompt("Enter peer ID:");
+            if (!peerId) {
+                logMessage("❌ No peer ID entered.");
+                return;
+            }
+
+            logMessage(`📤 Sending connection request to ${peerId}`);
+
+            peerConnection = createPeerConnection();
+            dataChannel = peerConnection.createDataChannel("fileTransfer", {
+            ordered: true,
+            reliable: true
+            });
+            setupDataChannel();
+
+            const offer = await peerConnection.createOffer();
+            await peerConnection.setLocalDescription(offer);
+
+            socket.send(JSON.stringify({
+                type: "offer",
+                offer: offer,
+                from: userId,
+                to: peerId
+            }));
+        }
+
+        function setupDataChannel() {
+            dataChannel.onopen = () => logMessage("📡 Data channel open.");
+            dataChannel.onmessage = handleIncomingFile;
+        }
+
+        function sendFile() {
+            const file = document.getElementById("fileInput").files[0];
+            if (!file || !dataChannel || dataChannel.readyState !== "open") {
+                logMessage("❌ No file selected or DataChannel not open.");
+                return;
+            }
+
+            logMessage(`📤 Sending file: ${file.name} (${file.size} bytes)`);
+
+            // Send file metadata first
+            dataChannel.send(JSON.stringify({ type: "file-info", name: file.name, size: file.size }));
+
+            const chunkSize = 64 * 1024; // 64 KB per chunk for large files
+            const reader = file.stream().getReader();
+
+            async function readAndSendChunk() {
+                const { done, value } = await reader.read();
+                if (done) {
+                    dataChannel.send("EOF");
+                    logMessage("✅ File sent successfully!");
+                    return;
+                }
+
+                // Wait if buffer is full
+                while (dataChannel.bufferedAmount > 512 * 1024) { // Prevents buffer overflow
+                    await new Promise((resolve) => setTimeout(resolve, 50)); 
+                }
+
+                dataChannel.send(value.buffer);
+                logMessage(`📤 Sent ${value.byteLength} bytes`);
+                readAndSendChunk();
+            }
+
+            readAndSendChunk();
+        }
+
+        function handleIncomingFile(event) {
+            if (typeof event.data === "string") {
+                if (event.data === "EOF") {
+                    logMessage("✅ File received successfully!");
+                    downloadFile();
+                    return;
+                } else if (event.data.startsWith("{")) {
+                    let fileInfo = JSON.parse(event.data);
+                    receivedFileName = fileInfo.name;
+                    expectedFileSize = fileInfo.size;
+                    logMessage(`📥 Receiving file: ${receivedFileName}, Size: ${expectedFileSize} bytes`);
+                    return;
+                }
+            }
+
+            // Handle binary chunks
+            receivedChunks.push(event.data);
+            receivedFileSize += event.data.byteLength;
+
+            let progress = Math.floor((receivedFileSize / expectedFileSize) * 100);
+            document.getElementById("progress").value = progress;
+            logMessage(`📥 Received ${progress}%`);
+
+            if (receivedFileSize >= expectedFileSize || event.data === "EOF") {
+                logMessage("✅ File transfer complete!");
+                downloadFile();
+            }
+        }
+
+        function downloadFile() {
+            const blob = new Blob(receivedChunks, { type: "application/octet-stream" });
+            const link = document.getElementById("downloadLink");
+            link.href = URL.createObjectURL(blob);
+            link.download = receivedFileName;
+            link.style.display = "block";
+            receivedChunks = [];
+        }
+    </script>
+</body>
+</html> -->
+
+<!-- 
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Peer-to-Peer File Sharing</title>
+  <style>
+    body { font-family: sans-serif; padding: 2rem; background: #f5f5f5; }
+    button { margin: 5px; }
+    #log { white-space: pre-wrap; background: #fff; padding: 1rem; border: 1px solid #ccc; max-height: 300px; overflow-y: auto; }
+    #peerList li { cursor: pointer; color: blue; }
+  </style>
+</head>
+<body>
+  <h1>Peer-to-Peer File Sharing</h1>
+  <button onclick="registerUser()">Register</button>
+  <button onclick="startConnection()">Connect to Peer</button>
+  <input type="file" id="fileInput" />
+  <button onclick="sendFile()">Send File</button>
+  <h3>Available Peers</h3>
+  <ul id="peerList"></ul>
+  <h3>Log</h3>
+  <div id="log"></div>
+
+  <script>
+    let socket;
+    let userId;
+    let peerId = null;
+    let peerConnection;
+    let dataChannel;
+    let receivedChunks = [];
+    let receivedFileName = "";
+    let expectedFileSize = 0;
+    let receivedFileSize = 0;
+    let fileReceived = false;
+
+    function logMessage(message) {
+      const log = document.getElementById("log");
+      log.textContent += `${message}\n`;
+      log.scrollTop = log.scrollHeight;
+    }
+
+    function registerUser() {
+      userId = prompt("Enter your unique ID:");
+      if (!userId) return;
+
+      socket = new WebSocket("ws://localhost:8080");
+
+      socket.onopen = () => {
+        socket.send(JSON.stringify({ type: "register", id: userId }));
+        logMessage("🔌 Connected to signaling server");
+      };
+
+      socket.onmessage = async (event) => {
+        const data = JSON.parse(event.data);
+
+        if (data.type === "peers") {
+          const list = document.getElementById("peerList");
+          list.innerHTML = "";
+          data.peers.forEach((peer) => {
+            if (peer !== userId) {
+              const li = document.createElement("li");
+              li.textContent = peer;
+              li.onclick = () => {
+                peerId = peer;
+                logMessage(`🎯 Selected peer: ${peerId}`);
+              };
+              list.appendChild(li);
+            }
+          });
+        } else if (data.type === "offer") {
+          peerId = data.from;
+          await createPeerConnection();
+          await peerConnection.setRemoteDescription(new RTCSessionDescription(data.offer));
+          const answer = await peerConnection.createAnswer();
+          await peerConnection.setLocalDescription(answer);
+          socket.send(JSON.stringify({ type: "answer", answer: answer, to: peerId, from: userId }));
+        } else if (data.type === "answer") {
+          await peerConnection.setRemoteDescription(new RTCSessionDescription(data.answer));
+        } else if (data.type === "candidate") {
+          if (data.candidate) {
+            await peerConnection.addIceCandidate(new RTCIceCandidate(data.candidate));
+          }
+        }
+      };
+    }
+
+    async function startConnection() {
+      if (!peerId) {
+        const manualPeerId = prompt("Enter peer ID manually:");
+        if (!manualPeerId) {
+          logMessage("❌ No peer selected or entered.");
+          return;
+        }
+        peerId = manualPeerId;
+      }
+
+      await createPeerConnection();
+      dataChannel = peerConnection.createDataChannel("fileTransfer");
+      setupDataChannel();
+
+      const offer = await peerConnection.createOffer();
+      await peerConnection.setLocalDescription(offer);
+      socket.send(JSON.stringify({ type: "offer", offer: offer, to: peerId, from: userId }));
+      console.log("Sending offer to:", peerId);
+    }
+
+    async function createPeerConnection() {
+      peerConnection = new RTCPeerConnection();
+
+      peerConnection.onicecandidate = (event) => {
+        if (event.candidate) {
+          socket.send(JSON.stringify({ type: "candidate", candidate: event.candidate, to: peerId, from: userId }));
+        }
+      };
+
+      peerConnection.ondatachannel = (event) => {
+        dataChannel = event.channel;
+        setupDataChannel();
+      };
+    }
+
+    function setupDataChannel() {
+      fileReceived = false;
+      receivedChunks = [];
+      expectedFileSize = 0;
+      receivedFileSize = 0;
+
+      dataChannel.onopen = () => logMessage("📡 Data channel open");
+
+      dataChannel.onmessage = (event) => {
+        if (typeof event.data === "string") {
+          if (event.data === "EOF" && !fileReceived) {
+            fileReceived = true;
+            logMessage("✅ File transfer complete!");
+            downloadFile();
+          } else if (event.data.startsWith("FILE_META")) {
+            const parts = event.data.split("|");
+            receivedFileName = parts[1];
+            expectedFileSize = parseInt(parts[2]);
+            receivedChunks = [];
+            receivedFileSize = 0;
+            fileReceived = false;
+            logMessage(`📄 Incoming file: ${receivedFileName} (${(expectedFileSize / 1024).toFixed(2)} KB)`);
+          }
+        } else {
+          receivedChunks.push(event.data);
+          receivedFileSize += event.data.byteLength;
+          logMessage(`⬇️ Receiving: ${(receivedFileSize / 1024).toFixed(2)} KB`);
+
+          if (receivedFileSize >= expectedFileSize && !fileReceived) {
+            fileReceived = true;
+            logMessage("✅ File transfer complete!");
+            downloadFile();
+          }
+        }
+      };
+    }
+
+    function sendFile() {
+      const fileInput = document.getElementById("fileInput");
+      const file = fileInput.files[0];
+      if (!file || !dataChannel || dataChannel.readyState !== "open") {
+        logMessage("❌ Cannot send file");
+        return;
+      }
+
+      logMessage(`📤 Sending file: ${file.name} (${(file.size / 1024).toFixed(2)} KB)`);
+      dataChannel.send(`FILE_META|${file.name}|${file.size}`);
+
+      const chunkSize = 16 * 1024;
+      const stream = file.stream();
+      const reader = stream.getReader();
+
+      const readChunk = async () => {
+        const { done, value } = await reader.read();
+        if (done) {
+          dataChannel.send("EOF");
+          logMessage("📤 File sent successfully");
+          return;
+        }
+        dataChannel.send(value.buffer);
+        await new Promise(resolve => setTimeout(resolve, 10)); // Throttle sending
+        readChunk();
+      };
+
+      readChunk();
+    }
+
+    function downloadFile() {
+      const blob = new Blob(receivedChunks, { type: "application/octet-stream" });
+      const a = document.createElement("a");
+      a.href = URL.createObjectURL(blob);
+      a.download = receivedFileName || "downloaded_file";
+      document.body.appendChild(a);
+      a.click();
+      a.remove();
+
+      console.log("Expected file size:", expectedFileSize);
+      console.log("Received file size:", receivedFileSize);
+      console.log("Blob size:", blob.size);
+    }
+  </script>
+</body>
+</html> -->
+
+<!-- <!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Peer-to-Peer File Sharing</title>
+  <style>
+    body { font-family: sans-serif; padding: 2rem; background: #f5f5f5; }
+    button { margin: 5px; }
+    #log { white-space: pre-wrap; background: #fff; padding: 1rem; border: 1px solid #ccc; max-height: 300px; overflow-y: auto; }
+    #peerList li { cursor: pointer; color: blue; }
+  </style>
+</head>
+<body>
+  <h1>Peer-to-Peer File Sharing</h1>
+  <button onclick="registerUser()">Register</button>
+  <button onclick="startConnection()">Connect to Peer</button>
+  <input type="file" id="fileInput" />
+  <button onclick="sendFile()">Send File</button>
+  <h3>Available Peers</h3>
+  <ul id="peerList"></ul>
+  <h3>Log</h3>
+  <div id="log"></div>
+
+  <script>
+    let socket;
+    let userId;
+    let peerId = null;
+    let peerConnection;
+    let dataChannel;
+    let receivedChunks = [];
+    let receivedFileName = "";
+    let expectedFileSize = 0;
+    let receivedFileSize = 0;
+    let fileReceived = false;
+
+    function logMessage(message) {
+      const log = document.getElementById("log");
+      log.textContent += `${message}\n`;
+      log.scrollTop = log.scrollHeight;
+    }
+
+    function registerUser() {
+      userId = prompt("Enter your unique ID:");
+      if (!userId) return;
+
+      socket = new WebSocket("ws://localhost:8080");
+
+      socket.onopen = () => {
+        socket.send(JSON.stringify({ type: "register", id: userId }));
+        logMessage("🔌 Connected to signaling server");
+      };
+
+      socket.onmessage = async (event) => {
+        const data = JSON.parse(event.data);
+
+        if (data.type === "peers") {
+          const list = document.getElementById("peerList");
+          list.innerHTML = "";
+          data.peers.forEach((peer) => {
+            if (peer !== userId) {
+              const li = document.createElement("li");
+              li.textContent = peer;
+              li.onclick = () => {
+                peerId = peer;
+                logMessage(`🎯 Selected peer: ${peerId}`);
+              };
+              list.appendChild(li);
+            }
+          });
+        } else if (data.type === "offer") {
+          peerId = data.from;
+          await createPeerConnection();
+          await peerConnection.setRemoteDescription(new RTCSessionDescription(data.offer));
+          const answer = await peerConnection.createAnswer();
+          await peerConnection.setLocalDescription(answer);
+          socket.send(JSON.stringify({ type: "answer", answer: answer, to: peerId, from: userId }));
+        } else if (data.type === "answer") {
+          await peerConnection.setRemoteDescription(new RTCSessionDescription(data.answer));
+        } else if (data.type === "candidate") {
+          if (data.candidate) {
+            await peerConnection.addIceCandidate(new RTCIceCandidate(data.candidate));
+          }
+        }
+      };
+    }
+
+    async function startConnection() {
+      if (!peerId) {
+        const manualPeerId = prompt("Enter peer ID manually:");
+        if (!manualPeerId) {
+          logMessage("❌ No peer selected or entered.");
+          return;
+        }
+        peerId = manualPeerId;
+      }
+
+      await createPeerConnection();
+      dataChannel = peerConnection.createDataChannel("fileTransfer");
+      setupDataChannel();
+
+      const offer = await peerConnection.createOffer();
+      await peerConnection.setLocalDescription(offer);
+      socket.send(JSON.stringify({ type: "offer", offer: offer, to: peerId, from: userId }));
+      console.log("Sending offer to:", peerId);
+    }
+
+    async function createPeerConnection() {
+      peerConnection = new RTCPeerConnection();
+
+      peerConnection.onicecandidate = (event) => {
+        if (event.candidate) {
+          socket.send(JSON.stringify({ type: "candidate", candidate: event.candidate, to: peerId, from: userId }));
+        }
+      };
+
+      peerConnection.ondatachannel = (event) => {
+        dataChannel = event.channel;
+        setupDataChannel();
+      };
+    }
+
+    function setupDataChannel() {
+      fileReceived = false;
+      receivedChunks = [];
+      expectedFileSize = 0;
+      receivedFileSize = 0;
+
+      dataChannel.onopen = () => logMessage("📡 Data channel open");
+
+      dataChannel.onmessage = (event) => {
+        if (typeof event.data === "string") {
+          if (event.data === "EOF" && !fileReceived) {
+            fileReceived = true;
+            logMessage("✅ File transfer complete!");
+            downloadFile();
+          } else if (event.data.startsWith("FILE_META")) {
+            const parts = event.data.split("|");
+            receivedFileName = parts[1];
+            expectedFileSize = parseInt(parts[2]);
+            receivedChunks = [];
+            receivedFileSize = 0;
+            fileReceived = false;
+            logMessage(`📄 Incoming file: ${receivedFileName} (${(expectedFileSize / 1024 / 1024).toFixed(2)} MB)`);
+          }
+        } else {
+          receivedChunks.push(event.data);
+          receivedFileSize += event.data.byteLength;
+          logMessage(`⬇️ Received: ${(receivedFileSize / 1024 / 1024).toFixed(2)} MB`);
+
+          if (receivedFileSize >= expectedFileSize && !fileReceived) {
+            fileReceived = true;
+            logMessage("✅ File transfer complete!");
+            downloadFile();
+          }
+        }
+      };
+    }
+
+    function sendFile() {
+      const fileInput = document.getElementById("fileInput");
+      const file = fileInput.files[0];
+      if (!file || !dataChannel || dataChannel.readyState !== "open") {
+        logMessage("❌ Cannot send file");
+        return;
+      }
+
+      logMessage(`📤 Sending file: ${file.name} (${(file.size / 1024 / 1024).toFixed(2)} MB)`);
+      dataChannel.send(`FILE_META|${file.name}|${file.size}`);
+
+      const chunkSize = 64 * 1024; // 64 KB chunks for large files
+      const stream = file.stream();
+      const reader = stream.getReader();
+      let sentSize = 0;
+
+      const readChunk = async () => {
+        let done = false;
+        while (!done) {
+          const result = await reader.read();
+          done = result.done;
+          if (done) break;
+
+          const value = result.value;
+
+          while (dataChannel.bufferedAmount > 64 * 1024) {
+            await new Promise(resolve => setTimeout(resolve, 50));
+          }
+
+          dataChannel.send(value.buffer);
+          sentSize += value.byteLength;
+          logMessage(`📤 Sent: ${(sentSize / 1024 / 1024).toFixed(2)} MB / ${(file.size / 1024 / 1024).toFixed(2)} MB`);
+        }
+
+        dataChannel.send("EOF");
+        logMessage("📤 File sent successfully");
+      };
+
+      readChunk();
+    }
+
+    function downloadFile() {
+      const blob = new Blob(receivedChunks, { type: "application/octet-stream" });
+      const a = document.createElement("a");
+      a.href = URL.createObjectURL(blob);
+      a.download = receivedFileName || "downloaded_file";
+      document.body.appendChild(a);
+      a.click();
+      a.remove();
+
+      console.log("Expected file size:", expectedFileSize);
+      console.log("Received file size:", receivedFileSize);
+      console.log("Blob size:", blob.size);
+    }
+  </script>
+</body>
+</html> -->
+
+
+
+
+
