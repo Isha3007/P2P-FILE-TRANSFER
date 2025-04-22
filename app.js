@@ -1,45 +1,3 @@
-// const WebSocket = require("ws");
-// const wss = new WebSocket.Server({ port: 8080 });
-
-// let peers = {};
-
-// wss.on("connection", (ws) => {
-//     let peerId = null;
-
-//     ws.on("message", (message) => {
-//         const data = JSON.parse(message);
-
-//         if (data.type === "register") {
-//             peerId = data.id;
-//             peers[peerId] = ws;
-//             console.log(`✅ Peer registered: ${peerId}`);
-//             sendPeerList();
-//         } else if (data.type === "offer" || data.type === "answer" || data.type === "candidate") {
-//             if (peers[data.to]) {
-//                 peers[data.to].send(JSON.stringify(data));
-//             } else {
-//                 console.log(`❌ Peer ${data.to} not found.`);
-//             }
-//         }
-//     });
-
-//     ws.on("close", () => {
-//         if (peerId) {
-//             delete peers[peerId];
-//             sendPeerList();
-//         }
-//     });
-
-//     function sendPeerList() {
-//         const peerList = Object.keys(peers);
-//         for (let id in peers) {
-//             peers[id].send(JSON.stringify({ type: "peerList", peers: peerList }));
-//         }
-//     }
-// });
-
-// console.log("✅ WebSocket signaling server running on ws://localhost:8080");
-
 const http = require("http");
 const fs = require("fs");
 const path = require("path");
@@ -117,7 +75,7 @@ wss.on("connection", (ws) => {
 });
 
 // Start server on port 8080
-const PORT = 80;
-server.listen(PORT, '0.0.0.0', () => {
-  console.log(`✅ Server running at http://0.0.0.0:${PORT}`);
+const PORT = process.env.PORT || 8080;
+server.listen(PORT, () => {
+  console.log(`✅ Server running at http://localhost:${PORT}`);
 });
